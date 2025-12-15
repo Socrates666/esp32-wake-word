@@ -23,9 +23,9 @@
 #include <cmath>
 #include "esp_adc/adc_continuous.h"
 #include "ring_buffer/ring_buffer.h"
-#include "audio/speech_features/dl_mfcc.hpp"
-#include "audio/speech_features/dl_speech_features.hpp"
-#include "audio/common/dl_audio_common.hpp"
+#include "dl_mfcc.hpp"
+#include "dl_speech_features.hpp"
+#include "dl_audio_common.hpp"
 
 #define EXAMPLE_ADC_UNIT                    ADC_UNIT_1
 #define EXAMPLE_ADC_CHANNEL                 ADC_CHANNEL_7
@@ -41,9 +41,12 @@
 
 static const char* TAG = "MAIN";
 
-using namespace dl;
-
 #include <math.h>
+extern const uint8_t model_espdl[] asm("_binary_xiaoa_noise_espdl_start");
+inline bool is_aligned(const void* ptr, size_t alignment) {
+    return ((uintptr_t)ptr % alignment) == 0;
+}
+
 int8_t data2[63*13]={
     -49,-58,-60,-61,-60,-63,-61,-63,-63,-62,-60,-52,-46,-41,-36,-31,-28,-32,-31,-32,-31,-35,-27,-21,-22,-24,-28,-33,-33,-34,-35,-35,-42,-26,-24,-26,-23,-23,-25,-26,-28,-31,-36,-41,-44,-46,-48,-51,-53,-55,-87,-87,-87,-87,-87,-87,-87,-87,-87,-87,-87,-87,-87,
 -1,-8,-8,-8,-8,-9,-9,-9,-8,-9,-8,-7,-15,-19,-23,-24,-28,-28,-27,-27,-26,-18,-8,1,2,2,3,3,4,4,7,6,-1,3,1,1,0,0,0,0,1,1,1,0,-2,-3,-4,-8,-8,-4,0,0,0,0,0,0,0,0,0,0,0,0,0,
@@ -171,12 +174,13 @@ void test_model(void){
         ESP_LOGE(TAG, "无法打开目录: %s", base_path);
         return;
     }
-    dl::Model *model =
-        new dl::Model("model", fbs::MODEL_LOCATION_IN_FLASH_PARTITION, 0, dl::MEMORY_MANAGER_GREEDY, nullptr, false);
+    printf("打开文件\n");
+    dl::Model *model = new dl::Model((const char *)model_espdl, fbs::MODEL_LOCATION_IN_FLASH_RODATA);
+    printf("模型测试\n");
     model->test();
     model->profile();
     init_dl_mfcc();
-    audio::MFCC wake_mfcc(wake_config);
+    dl::audio::MFCC wake_mfcc(wake_config);
     float c=0;
     float total=0;
     while ((entry = readdir(dir)) != NULL) {
@@ -187,18 +191,19 @@ void test_model(void){
         wav::WavHeader audio(path);
         if(audio.getFileStatus()==WAV_OPEND){
             fseek(audio.getFilePtr(), audio.getRawDataPosition(), SEEK_SET);
-            int16_t* raw_data = (int16_t*)heap_caps_malloc(16000 * sizeof(int16_t), MALLOC_CAP_32BIT);
+            int16_t* raw_data = (int16_t*)heap_caps_malloc(16000 * sizeof(int16_t), MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
             // float* float_raw_data = (float*)heap_caps_malloc(16000* sizeof(float), MALLOC_CAP_32BIT);
             memset(raw_data, 0, 16000*sizeof(int16_t));
             size_t read_count = fread(raw_data, sizeof(int16_t), audio.getDataLength(), audio.getFilePtr());
             if (read_count != audio.getDataLength()/2) {
                 printf("读取数据不完整，期望 %ld，实际 %zu\n", audio.getDataLength()/2, read_count);
             }
-            float* mfcc = (float*)heap_caps_malloc(13*63* sizeof(float), MALLOC_CAP_32BIT);
+
+            float* mfcc = (float*)heap_caps_malloc(13*63* sizeof(float), MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
             memset(mfcc, 0, 13*63*sizeof(int16_t));
             int mfcc_ptr, raw_ptr;
             mfcc_ptr=0;raw_ptr=0;
-            int16_t* data_frame = (int16_t*)heap_caps_malloc(320* sizeof(int16_t), MALLOC_CAP_8BIT);
+            int16_t* data_frame = (int16_t*)heap_caps_malloc(320* sizeof(int16_t), MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
             while(mfcc_ptr < 63){
                 int16_t prev = mfcc_ptr > 0? *(raw_data+raw_ptr-1) : 0;
                 memcpy(data_frame, raw_data+raw_ptr, 320*sizeof(int16_t));
@@ -229,12 +234,14 @@ void test_model(void){
             //     printf("%.2f ", my_mfcc[i]);
             // }
             // standardize_mfcc(mfcc, 63, 13);
+
+            // 在关键点添加调试信息
             std::map<std::string, dl::TensorBase *> model_inputs = model->get_inputs();
             dl::TensorBase *model_input = model_inputs.begin()->second;
             std::map<std::string, dl::TensorBase *> model_outputs = model->get_outputs();
             dl::TensorBase *model_output = model_outputs.begin()->second;
             std::vector<int> input_shape = model_input->get_shape();
-            dl::TensorBase mfcc_tensor(input_shape, mfcc, 0, dl::DATA_TYPE_FLOAT, true);
+            dl::TensorBase mfcc_tensor(input_shape, mfcc, 0, dl::DATA_TYPE_FLOAT, true, MALLOC_CAP_8BIT);
             model_input->exponent=0;
             bool res = model_input->assign(&mfcc_tensor);
 
@@ -258,6 +265,7 @@ void test_model(void){
             }
             
             float sigmoid = 1 / (1 + exp(-output_value));
+
             ESP_LOGI(TAG, "唤醒词概率: %.2f%%", sigmoid*100);
             total++;
             if(sigmoid>0.5) c++;
@@ -306,6 +314,7 @@ extern "C" void app_main(void)
     //     test_mfcc(16000);
     //     vTaskDelay(1000 / portTICK_PERIOD_MS);
     // }
+
     test_model();
     for (;;) {
         vTaskDelay(1000 / portTICK_PERIOD_MS);
