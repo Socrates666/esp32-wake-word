@@ -7,7 +7,7 @@ set(src_dirs    ./src
 set(include_dirs ./include
                 )
 
-set(requires        esp_dl
+set(requires        esp-dl
                     spi_flash)
 
 idf_component_register(SRCS ${srcs} SRC_DIRS ${src_dirs} INCLUDE_DIRS ${include_dirs} REQUIRES ${requires})
