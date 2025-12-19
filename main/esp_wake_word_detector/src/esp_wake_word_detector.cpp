@@ -162,20 +162,66 @@ void detect_task(void* param){
     static std::vector<int> input_shape = model_input->get_shape();
     
     static int8_t* data_ptr;
+    
+    // ✅ CMVN 输出缓冲（量化后的 int8）
+    static int8_t mfcc_cmvn_buffer[13 * 64];
+    
     int inference_count = 0;
     
     while(1){
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
         
         data_ptr = read_whole_mfcc_buffer();
-        //xTaskNotifyGive(record_audio_task_handle);
 
         if (data_ptr != NULL) {
+            uint32_t cmvn_start = esp_timer_get_time() / 1000;
+            
+            // ✅ Step 1: 计算每个维度的均值（用浮点数计算统计）
+            float mean[13] = {0.0f};
+            for (int dim = 0; dim < 13; dim++) {
+                float sum = 0.0f;
+                for (int frame = 0; frame < 63; frame++) {  // 63 帧
+                    sum += (float)data_ptr[frame * 13 + dim];
+                }
+                mean[dim] = sum / 63.0f;
+            }
+            
+            // ✅ Step 2: 计算每个维度的标准差
+            float std_dev[13] = {0.0f};
+            for (int dim = 0; dim < 13; dim++) {
+                float variance = 0.0f;
+                for (int frame = 0; frame < 63; frame++) {
+                    float diff = (float)data_ptr[frame * 13 + dim] - mean[dim];
+                    variance += diff * diff;
+                }
+                std_dev[dim] = sqrtf(variance / 63.0f);
+            }
+            
+            // ✅ Step 3: CMVN 归一化（int8 输入 → 浮点计算 → int8 输出）
+            float epsilon = 1e-8f;
+            for (int i = 0; i < 13 * 63; i++) {
+                int dim = i % 13;
+                float normalized = ((float)data_ptr[i] - mean[dim]) / (std_dev[dim] + epsilon);
+                
+                // 直接量化为 int8
+                int32_t quantized = (int32_t)lroundf(normalized);
+                if (quantized > 127) quantized = 127;
+                if (quantized < -128) quantized = -128;
+                mfcc_cmvn_buffer[i] = (int8_t)quantized;
+            }
+            
+            uint32_t cmvn_end = esp_timer_get_time() / 1000;
+            
+            // ✅ Step 4: 模型推理（使用 CMVN 后的 int8 数据）
             int input_exponent = model_input->exponent;
-            dl::TensorBase mfcc_tensor(input_shape, data_ptr, input_exponent, dl::DATA_TYPE_INT8, false);
+            dl::TensorBase mfcc_tensor(input_shape, mfcc_cmvn_buffer, 
+                                       0, dl::DATA_TYPE_INT8, false);
             
             bool res = model_input->assign(&mfcc_tensor);
+            
+            uint32_t run_start = esp_timer_get_time() / 1000;
             model->run();
+            uint32_t run_end = esp_timer_get_time() / 1000;
             
             int8_t raw_output = model_output->get_element<int8_t>(0);
             float output_float = raw_output * powf(2.0f, model_output->exponent);
@@ -183,10 +229,17 @@ void detect_task(void* param){
             
             inference_count++;
             if (inference_count % 10 == 1) {
-                ESP_LOGI("detect", "Raw output: %d, Float: %.4f, Sigmoid: %.2f%%", 
-                        raw_output, output_float, sigmoid);
-                ESP_LOGI("detect", "MFCC[0..4]: %d,%d,%d,%d,%d", 
+                ESP_LOGI("detect", "Raw: %d, Float: %.4f, Sigmoid: %.2f%% | CMVN: %lums, Run: %lums", 
+                        raw_output, output_float, sigmoid, 
+                        cmvn_end - cmvn_start, run_end - run_start);
+                
+                ESP_LOGI("detect", "MFCC[0..4] orig: %d,%d,%d,%d,%d", 
                         data_ptr[0], data_ptr[1], data_ptr[2], data_ptr[3], data_ptr[4]);
+                ESP_LOGI("detect", "MFCC[0..4] cmvn: %d,%d,%d,%d,%d", 
+                        mfcc_cmvn_buffer[0], mfcc_cmvn_buffer[1], mfcc_cmvn_buffer[2], 
+                        mfcc_cmvn_buffer[3], mfcc_cmvn_buffer[4]);
+                ESP_LOGI("detect", "Mean[0..4]: %.2f,%.2f,%.2f,%.2f,%.2f", 
+                        mean[0], mean[1], mean[2], mean[3], mean[4]);
             }
             
             if(sigmoid >= 80){
@@ -196,8 +249,8 @@ void detect_task(void* param){
                 
                 // 重置缓冲区
                 xSemaphoreTake(mutex, portMAX_DELAY);
-                memset(mfcc_buffer, 0, MFCC_LEN);
-                memset(static_buffer, 0, MFCC_LEN);
+                memset(mfcc_buffer, 0, MFCC_LEN * sizeof(int8_t));
+                memset(static_buffer, 0, MFCC_LEN * sizeof(int8_t));
                 shared_counter = 0;
                 buffer_head = 0;
                 buffer_tail = 0;
@@ -228,4 +281,5 @@ esp_err_t wakeWord_detection_open(wakeWord_detection_config_t* wake_config){
 void wakeWord_detection_close(void){
     if(record_audio_task_handle) vTaskDelete(record_audio_task_handle);
     if(wake_word_task_handle) vTaskDelete(wake_word_task_handle);
+    if(mutex) vSemaphoreDelete(mutex);
 }
